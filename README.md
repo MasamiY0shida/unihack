@@ -1,6 +1,6 @@
 # NBA Shadow Trader
 
-Three services, one command each. Run them in order.
+Four services, one command each. Run them in order.
 
 ## Prerequisites
 
@@ -12,47 +12,70 @@ Three services, one command each. Run them in order.
 
 ---
 
-## 1 — Alpha Engine (Python · port 8000)
+## One-time setup
+
+Create a single venv at the project root — it covers all Python services:
 
 ```bash
-cd alpha-engine
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# Train the model first (one-time, ~5 min)
-python ../../model.py
-
-# Start inference server
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# From the project root
+python3 -m venv venv
+source venv/bin/activate
+pip install -r alpha-engine/requirements.txt
+pip install pyarrow
 ```
+
+> **Important:** Always use `./venv/bin/python` (or `./venv/bin/pip`) directly instead of bare `python`/`uvicorn`, to avoid Anaconda or system Python shadowing the venv.
+
+---
+
+## 1 — Live Game Server (Python · port 8000)
+
+```bash
+./venv/bin/python -m uvicorn server:app --reload --port 8000
+```
+
+Polls the NBA live API for scores and game state. The Execution Engine reads from this.
 
 Health check: http://localhost:8000/health
 
 ---
 
-## 2 — Execution Engine (Rust · writes to ../trades.sqlite)
+## 2 — Alpha Engine (Python · port 8001)
+
+```bash
+./venv/bin/python alpha-engine/main.py
+```
+
+Loads the trained XGBoost model suite and serves win-probability predictions.
+
+Health check: http://localhost:8001/health
+
+---
+
+## 3 — Execution Engine (Rust · port 4000)
 
 ```bash
 cd execution-engine
 cargo run --release
 ```
 
-Reads from Polymarket WebSocket, queries Alpha Engine, writes shadow trades to `trades.sqlite`.
+Connects to Polymarket WebSocket, queries the Alpha Engine on each price tick, and logs shadow trades to `trades.sqlite`.
 
-Env vars (optional):
+Optional env vars:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EDGE_THRESHOLD` | `0.05` | Minimum model–market spread to trigger a trade |
 | `RUST_LOG` | `info` | Log level (`debug` for verbose) |
 
 ```bash
 RUST_LOG=debug cargo run --release
 ```
 
+Health check: http://localhost:4000/health
+
 ---
 
-## 3 — Dashboard (Next.js · port 3000)
+## 4 — Dashboard (Next.js · port 3000)
 
 ```bash
 cd dashboard
@@ -60,18 +83,22 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000 — polls the backend every 3 s.
+Open http://localhost:3000 — polls the Execution Engine every 3 s for live trades and wallet state.
 
 ---
 
 ## Data flow
 
 ```
-Polymarket WS ──► Execution Engine ──► SQLite (trades.sqlite)
-                        │                       ▲
-                        ▼                       │
-                  Alpha Engine (Python)   Dashboard (Next.js)
-                  POST /predict           GET /api/trades
+Polymarket WS ──► Execution Engine (port 4000) ──► SQLite (trades.sqlite)
+                        │         │                        ▲
+                        │         └──► Alpha Engine        │
+                        │              POST /predict       │
+                        │              (port 8001)         │
+                        │                                  │
+                        └──► Live Game Server         Dashboard (port 3000)
+                              GET /games               GET /trades, /wallet
+                              (port 8000)
 ```
 
 ---
@@ -79,17 +106,20 @@ Polymarket WS ──► Execution Engine ──► SQLite (trades.sqlite)
 ## Project structure
 
 ```
-nba-trading-bot/
-├── alpha-engine/        # FastAPI win-probability server
+unihack/
+├── server.py               # Live game state server (port 8000)
+├── features.py             # Shared FeatureEngine
+├── market_data.py          # Polymarket odds helpers
+├── model.py / model_v2.py  # Model training scripts
+├── trades.sqlite           # Shadow trade log (auto-created)
+├── alpha-engine/           # FastAPI ML inference server (port 8001)
 │   ├── main.py
 │   └── requirements.txt
-├── execution-engine/    # Rust WebSocket + shadow trader
+├── execution-engine/       # Rust WebSocket + shadow trader (port 4000)
 │   ├── Cargo.toml
 │   └── src/main.rs
-├── dashboard/           # Next.js real-time UI
+├── dashboard/              # Next.js real-time UI (port 3000)
 │   ├── package.json
-│   ├── next.config.js
-│   └── src/app/
-├── .gitignore
-└── README.md
+│   └── src/
+└── venv/                   # Shared Python venv (gitignored)
 ```
