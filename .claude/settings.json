@@ -11,7 +11,12 @@
       "Bash(source /Users/masamiyoshida/Documents/unihack/venv/bin/activate)",
       "Bash(grep -r \"points_in_the_paint\\\\|fast_break\\\\|second_chance\\\\|bench\\\\|biggest_lead\\\\|pts_paint\\\\|fbp\\\\|scp\\\\|pot\" /Users/masamiyoshida/Documents/unihack/*.py)",
       "Bash(grep -r \"boxscore\\\\|pts_paint\\\\|bench_pts\\\\|biggest_lead\" /Users/masamiyoshida/Documents/unihack/*.py)",
-      "Bash(./venv/bin/python -c \":*)"
+      "Bash(./venv/bin/python -c \":*)",
+      "Bash(python -c \":*)",
+      "Bash(curl -s -o /dev/null -w \"HTTP Status: %{http_code}\\\\nTime: %{time_total}s\\\\nIP: %{remote_ip}\\\\n\" --max-time 10 \"https://stats.nba.com/stats/boxscoremiscv3?GameID=0022500001&LeagueID=00\" -H \"User-Agent: Mozilla/5.0\" -H \"Referer: https://www.nba.com/\" -H \"Origin: https://www.nba.com\" -H \"x-nba-stats-origin: stats\" -H \"x-nba-stats-token: true\")",
+      "Bash(curl -s -o /dev/null -w \"HTTP Status: %{http_code}\\\\nTime: %{time_total}s\\\\n\" --max-time 10 \"https://www.nba.com\" -H \"User-Agent: Mozilla/5.0\")",
+      "Bash(curl -s --max-time 10 \"https://cdn.nba.com/stats/scores/leagueSchedule.json\" -H \"User-Agent: Mozilla/5.0\")",
+      "Bash(curl -s --max-time 15 \"https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData/boxscore/boxscore_0022500001.json\")"
     ]
   }
 }

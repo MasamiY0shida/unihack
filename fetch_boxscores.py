@@ -1,20 +1,21 @@
 """
 Fetch Historical Advanced Boxscore Data
 ========================================
-Pulls per-game advanced team/player stats from the NBA Stats API for all
-games in season_games.parquet. Produces data/boxscore_advanced.parquet which
-model_v2.py uses to populate the ~15 features that were previously zero
+Pulls per-game advanced team/player stats from the NBA live data endpoint
+for all games in season_games.parquet. Produces data/boxscore_advanced.parquet
+which model_v2.py uses to populate the ~15 features that were previously zero
 during training (pts_paint, bench_pts, star_pm, star_mins, lineup_pm, etc.).
 
 Usage:
-    ./venv/bin/python fetch_boxscores.py
+    python fetch_boxscores.py
 
-Takes ~30-50 minutes for ~989 games (rate-limited API calls).
+Takes ~20-30 minutes for ~989 games (rate-limited).
 Safe to re-run — skips games already fetched.
 """
 
 import pandas as pd
 import numpy as np
+import requests
 import time
 import os
 import sys
@@ -22,109 +23,97 @@ import sys
 DATA_DIR = "data"
 OUTPUT_PATH = f"{DATA_DIR}/boxscore_advanced.parquet"
 
-# Custom headers to avoid stats.nba.com blocking/timeouts
-CUSTOM_HEADERS = {
-    "Host": "stats.nba.com",
-    "Connection": "keep-alive",
-    "Accept": "application/json, text/plain, */*",
-    "x-nba-stats-token": "true",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "x-nba-stats-origin": "stats",
-    "Referer": "https://www.nba.com/",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://www.nba.com",
-}
+# NBA live data endpoint — no auth/headers needed, no blocking
+BOXSCORE_URL = (
+    "https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com"
+    "/NBA/liveData/boxscore/boxscore_{game_id}.json"
+)
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+})
 
 
 def parse_minutes(mins_str):
-    """Parse NBA minutes string like '33:14' to float minutes."""
-    if not mins_str or mins_str == "":
+    """Parse NBA minutes string like 'PT33M14.00S' to float minutes."""
+    if not mins_str:
         return 0.0
+    s = str(mins_str)
+    # Format: PT33M14.00S
+    if s.startswith("PT"):
+        s = s[2:]  # Remove PT
+        minutes = 0.0
+        if "M" in s:
+            m_part, s = s.split("M", 1)
+            minutes += float(m_part)
+        if "S" in s:
+            s_part = s.replace("S", "")
+            if s_part:
+                minutes += float(s_part) / 60.0
+        return minutes
+    # Fallback: "33:14" format
     try:
-        parts = str(mins_str).split(":")
+        parts = s.split(":")
         return float(parts[0]) + float(parts[1]) / 60 if len(parts) == 2 else float(parts[0])
     except (ValueError, IndexError):
         return 0.0
 
 
 def fetch_game_boxscore(game_id):
-    """Fetch advanced boxscore for a single game. Returns a dict or None."""
-    from nba_api.stats.endpoints import boxscoretraditionalv3, boxscoremiscv3
-    import warnings
-    warnings.filterwarnings("ignore")
+    """Fetch boxscore for a single game from NBA S3 endpoint. Returns a dict or None."""
+    url = BOXSCORE_URL.format(game_id=game_id)
+
+    try:
+        resp = SESSION.get(url, timeout=30)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        game = resp.json()["game"]
+    except Exception as e:
+        print(f"  Fetch failed for {game_id}: {e}")
+        return None
 
     result = {"GAME_ID": game_id}
 
-    # ── Misc stats (scoring breakdown) ──
-    try:
-        misc = boxscoremiscv3.BoxScoreMiscV3(
-            game_id=game_id, headers=CUSTOM_HEADERS, timeout=60
-        )
-        md = misc.get_dict()["boxScoreMisc"]
+    for side, key in [("HOME", "homeTeam"), ("AWAY", "awayTeam")]:
+        team = game.get(key, {})
+        result[f"{side}_TEAM_ID"] = team.get("teamId", 0)
 
-        for side, key in [("HOME", "homeTeam"), ("AWAY", "awayTeam")]:
-            team = md.get(key, {})
-            result[f"{side}_TEAM_ID"] = team.get("teamId", 0)
-            stats = team.get("statistics", {})
-            result[f"{side}_PTS_PAINT"] = stats.get("pointsPaint", 0)
-            result[f"{side}_PTS_FASTBREAK"] = stats.get("pointsFastBreak", 0)
-            result[f"{side}_PTS_2ND"] = stats.get("pointsSecondChance", 0)
-            result[f"{side}_PTS_OFF_TO"] = stats.get("pointsOffTurnovers", 0)
-    except Exception as e:
-        print(f"  Misc fetch failed for {game_id}: {e}")
-        return None
+        # Team-level stats
+        stats = team.get("statistics", {})
+        result[f"{side}_PTS_PAINT"] = stats.get("pointsInThePaint", 0)
+        result[f"{side}_PTS_FASTBREAK"] = stats.get("pointsFastBreak", 0)
+        result[f"{side}_PTS_2ND"] = stats.get("pointsSecondChance", 0)
+        result[f"{side}_PTS_OFF_TO"] = stats.get("pointsFromTurnovers", 0)
+        result[f"{side}_BENCH_PTS"] = stats.get("benchPoints", 0)
 
-    time.sleep(1.0)
+        # Player-level stats for star/lineup
+        players = team.get("players", [])
+        pdata = []
+        for p in players:
+            ps = p.get("statistics", {})
+            mins = parse_minutes(ps.get("minutes", ""))
+            pdata.append({
+                "mins": mins,
+                "pm": float(ps.get("plusMinusPoints", 0) or 0),
+            })
 
-    # ── Traditional stats (player-level for star/bench/lineup) ──
-    try:
-        trad = boxscoretraditionalv3.BoxScoreTraditionalV3(
-            game_id=game_id, headers=CUSTOM_HEADERS, timeout=60
-        )
-        td = trad.get_dict()["boxScoreTraditional"]
+        if not pdata:
+            result[f"{side}_STAR_PM"] = 0
+            result[f"{side}_STAR_MINS_TOTAL"] = 0
+            result[f"{side}_LINEUP_PM"] = 0
+            continue
 
-        for side, key in [("HOME", "homeTeam"), ("AWAY", "awayTeam")]:
-            team = td.get(key, {})
-            players = team.get("players", [])
+        # Star player = highest minutes (matches inference definition in server.py)
+        star = max(pdata, key=lambda x: x["mins"])
+        result[f"{side}_STAR_PM"] = star["pm"]
+        result[f"{side}_STAR_MINS_TOTAL"] = star["mins"]
 
-            # Parse player data
-            pdata = []
-            for p in players:
-                ps = p.get("statistics", {})
-                mins = parse_minutes(ps.get("minutes", ""))
-                pdata.append({
-                    "name": f"{p.get('firstName', '')} {p.get('familyName', '')}",
-                    "mins": mins,
-                    "pm": float(ps.get("plusMinusPoints", 0) or 0),
-                    "pts": int(ps.get("points", 0) or 0),
-                    "fga": int(ps.get("fieldGoalsAttempted", 0) or 0),
-                })
-
-            if not pdata:
-                result[f"{side}_STAR_PM"] = 0
-                result[f"{side}_STAR_MINS_TOTAL"] = 0
-                result[f"{side}_LINEUP_PM"] = 0
-                result[f"{side}_BENCH_PTS"] = 0
-                continue
-
-            # Star player = highest minutes (matches inference definition in server.py)
-            star = max(pdata, key=lambda x: x["mins"])
-            result[f"{side}_STAR_PM"] = star["pm"]
-            result[f"{side}_STAR_MINS_TOTAL"] = star["mins"]
-
-            # Lineup PM = sum of top-5-by-minutes players' plus/minus
-            by_mins = sorted(pdata, key=lambda x: x["mins"], reverse=True)
-            starters = by_mins[:5]
-            bench = by_mins[5:]
-            result[f"{side}_LINEUP_PM"] = sum(p["pm"] for p in starters)
-
-            # Bench points
-            result[f"{side}_BENCH_PTS"] = sum(p["pts"] for p in bench)
-
-    except Exception as e:
-        print(f"  Traditional fetch failed for {game_id}: {e}")
-        return None
+        # Lineup PM = sum of top-5-by-minutes players' plus/minus
+        by_mins = sorted(pdata, key=lambda x: x["mins"], reverse=True)
+        starters = by_mins[:5]
+        result[f"{side}_LINEUP_PM"] = sum(p["pm"] for p in starters)
 
     return result
 
@@ -151,9 +140,20 @@ def main():
         print("All games already fetched!")
         return
 
+    # Quick connectivity test
+    print("Testing API connectivity...")
+    test = fetch_game_boxscore(remaining[0])
+    if test:
+        rows.append(test)
+        print(f"  OK: {remaining[0]} — home paint pts: {test.get('HOME_PTS_PAINT')}")
+        remaining = remaining[1:]
+    else:
+        print("  FAILED — check network connectivity")
+        sys.exit(1)
+
+    failed = []
     for i, game_id in enumerate(remaining):
-        if i > 0 and i % 50 == 0:
-            # Save progress every 50 games
+        if (i + 1) % 50 == 0:
             df = pd.DataFrame(rows)
             df.to_parquet(OUTPUT_PATH, index=False)
             print(f"  Progress saved: {len(rows)} games total")
@@ -164,23 +164,25 @@ def main():
             if result:
                 break
             wait = 5 * (attempt + 1)
-            print(f"  Retry {attempt+1}/2 for {game_id} in {wait}s...")
+            print(f"  Retry {attempt+1}/3 for {game_id} in {wait}s...")
             time.sleep(wait)
 
         if result:
             rows.append(result)
-            if i % 20 == 0:
-                print(f"  [{i+1}/{len(remaining)}] {game_id} OK")
+            if (i + 1) % 50 == 0:
+                print(f"  [{i+2}/{len(remaining)+1}] {len(rows)} fetched, {len(failed)} failed")
         else:
-            print(f"  [{i+1}/{len(remaining)}] {game_id} FAILED after 3 attempts")
+            failed.append(game_id)
 
-        time.sleep(1.0)  # Rate limiting
+        time.sleep(0.5)  # Light rate limiting (S3 is generous)
 
     # Final save
     df = pd.DataFrame(rows)
     df.to_parquet(OUTPUT_PATH, index=False)
     print(f"\nDone! Saved {len(df)} games to {OUTPUT_PATH}")
     print(f"Columns: {list(df.columns)}")
+    if failed:
+        print(f"Failed games ({len(failed)}): {failed[:20]}{'...' if len(failed) > 20 else ''}")
 
 
 if __name__ == "__main__":
