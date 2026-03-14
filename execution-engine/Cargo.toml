@@ -39,3 +39,9 @@ tower-http         = { version = "0.5", features = ["cors"] }
 # Logging
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Testnet order signing (EIP-712)
+secp256k1          = { version = "0.28", features = ["recovery", "global-context"] }
+sha3               = "0.10"
+hex                = "0.4"
+num-bigint         = "0.4"

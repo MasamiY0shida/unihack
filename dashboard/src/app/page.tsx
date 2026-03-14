@@ -13,6 +13,16 @@ interface Trade {
   stake_amount:        number;
   status:              string;
   pnl:                 number | null;
+  order_hash:          string | null;
+  signed_tx:           string | null;
+}
+
+interface WalletInfo {
+  address:      string;
+  usdc_balance: number;
+  chain_id:     number;
+  chain:        string;
+  initial_usdc: number;
 }
 
 function fmt(dt: string) {
@@ -22,18 +32,27 @@ function fmt(dt: string) {
   });
 }
 
+function shortHash(h: string | null, len = 10): string {
+  if (!h) return "—";
+  return h.length > len + 4 ? `${h.slice(0, len)}…` : h;
+}
+
 export default function Dashboard() {
   const [trades, setTrades]         = useState<Trade[]>([]);
+  const [wallet, setWallet]         = useState<WalletInfo | null>(null);
   const [loading, setLoading]       = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [connected, setConnected]   = useState(false);
 
   useEffect(() => {
-    const fetchTrades = async () => {
+    const fetchAll = async () => {
       try {
-        const res  = await fetch("/api/trades");
-        const data = await res.json();
-        setTrades(data);
+        const [tradesRes, walletRes] = await Promise.all([
+          fetch("/api/trades"),
+          fetch("/api/wallet"),
+        ]);
+        setTrades(await tradesRes.json());
+        setWallet(await walletRes.json());
         setLastUpdated(new Date());
         setConnected(true);
       } catch {
@@ -43,22 +62,23 @@ export default function Dashboard() {
       }
     };
 
-    fetchTrades();
-    const interval = setInterval(fetchTrades, 3000);
+    fetchAll();
+    const interval = setInterval(fetchAll, 3000);
     return () => clearInterval(interval);
   }, []);
 
   // ── Derived stats ──
-  const won        = trades.filter(t => t.status === "WON").length;
-  const lost       = trades.filter(t => t.status === "LOST").length;
-  const open       = trades.filter(t => t.status === "OPEN").length;
-  const resolved   = won + lost;
-  const winRate    = resolved > 0 ? (won / resolved) * 100 : 0;
-  const totalPnl   = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const won         = trades.filter(t => t.status === "WON").length;
+  const lost        = trades.filter(t => t.status === "LOST").length;
+  const open        = trades.filter(t => t.status === "OPEN").length;
+  const resolved    = won + lost;
+  const winRate     = resolved > 0 ? (won / resolved) * 100 : 0;
+  const totalPnl    = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
   const totalStaked = trades.reduce((s, t) => s + t.stake_amount, 0);
-  const avgEdge    = trades.length > 0
+  const avgEdge     = trades.length > 0
     ? trades.reduce((s, t) => s + Math.abs(t.model_implied_prob - t.market_implied_prob), 0) / trades.length * 100
     : null;
+  const signedCount = trades.filter(t => t.order_hash).length;
 
   const openTrades = trades.filter(t => t.status === "OPEN");
 
@@ -70,7 +90,7 @@ export default function Dashboard() {
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div>
             <h1 className="text-lg font-bold text-green-400 tracking-widest">NBA SHADOW TRADER</h1>
-            <p className="text-xs text-gray-600 mt-0.5">Quantitative prediction market engine · paper trading only</p>
+            <p className="text-xs text-gray-600 mt-0.5">Quantitative prediction market engine · testnet order signing</p>
           </div>
           <div className="flex items-center gap-4 text-xs">
             {lastUpdated && (
@@ -87,6 +107,49 @@ export default function Dashboard() {
       </div>
 
       <div className="max-w-7xl mx-auto px-6 py-8 space-y-10">
+
+        {/* ── Wallet panel ── */}
+        {wallet && (
+          <section>
+            <SectionHeader label="Testnet Wallet" color="text-cyan-400" count={-1} />
+            <div className="bg-gray-900 border border-cyan-900/40 rounded-lg p-5 space-y-3">
+              <div className="flex flex-wrap items-center gap-x-8 gap-y-2 text-xs">
+                <DataPoint label="Address">
+                  <span className="text-cyan-300 font-semibold">{wallet.address}</span>
+                </DataPoint>
+                <DataPoint label="Chain">
+                  <span className="text-gray-400">{wallet.chain} (ID {wallet.chain_id})</span>
+                </DataPoint>
+                <DataPoint label="Signed orders">
+                  <span className="text-purple-400 font-semibold">{signedCount}</span>
+                </DataPoint>
+              </div>
+              <div className="flex items-end gap-6 pt-1">
+                <div>
+                  <p className="text-gray-500 text-xs uppercase tracking-widest mb-1">Fake USDC Balance</p>
+                  <p className={`text-3xl font-bold ${wallet.usdc_balance >= wallet.initial_usdc ? "text-green-400" : wallet.usdc_balance >= wallet.initial_usdc * 0.8 ? "text-yellow-400" : "text-red-400"}`}>
+                    ${wallet.usdc_balance.toFixed(2)}
+                  </p>
+                  <p className="text-gray-600 text-xs mt-0.5">
+                    started at ${wallet.initial_usdc.toLocaleString()} ·{" "}
+                    <span className={wallet.usdc_balance >= wallet.initial_usdc ? "text-green-500" : "text-red-500"}>
+                      {wallet.usdc_balance >= wallet.initial_usdc ? "+" : ""}
+                      ${(wallet.usdc_balance - wallet.initial_usdc).toFixed(2)} net
+                    </span>
+                  </p>
+                </div>
+                <div className="h-12 w-px bg-gray-800" />
+                <div>
+                  <p className="text-gray-500 text-xs uppercase tracking-widest mb-1">EIP-712 Signing</p>
+                  <p className="text-xs text-gray-300">
+                    Polymarket CLOB orders are signed with a secp256k1 test key.<br />
+                    Each order hash is stored in the DB — ready for CLOB submission.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
 
         {/* ── Stats bar ── */}
         <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
@@ -163,6 +226,7 @@ export default function Dashboard() {
                     <th className="px-4 py-3">Market %</th>
                     <th className="px-4 py-3">Model %</th>
                     <th className="px-4 py-3">Edge</th>
+                    <th className="px-4 py-3">Order Hash</th>
                     <th className="px-4 py-3">Status</th>
                     <th className="px-4 py-3 text-right">PnL</th>
                   </tr>
@@ -189,6 +253,18 @@ export default function Dashboard() {
                         <td className="px-4 py-3 text-gray-300">{(t.model_implied_prob  * 100).toFixed(1)}%</td>
                         <td className={`px-4 py-3 font-bold ${edge >= 0 ? "text-green-400" : "text-red-400"}`}>
                           {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
+                        </td>
+                        <td className="px-4 py-3">
+                          {t.order_hash ? (
+                            <span
+                              className="text-cyan-500 cursor-help font-mono"
+                              title={t.order_hash}
+                            >
+                              {shortHash(t.order_hash, 12)}
+                            </span>
+                          ) : (
+                            <span className="text-gray-700">—</span>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <StatusBadge status={t.status} />
@@ -235,7 +311,7 @@ function SectionHeader({
     <h2 className={`text-xs font-bold uppercase tracking-widest mb-4 flex items-center gap-2 ${color}`}>
       {pulse && <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" />}
       {label}
-      <span className="text-gray-600 font-normal">({count})</span>
+      {count >= 0 && <span className="text-gray-600 font-normal">({count})</span>}
     </h2>
   );
 }
@@ -268,6 +344,15 @@ function ActivePositionCard({ trade }: { trade: Trade }) {
           <span className="text-gray-300">{(trade.model_implied_prob * 100).toFixed(1)}%</span>
         </DataPoint>
       </div>
+
+      {trade.order_hash && (
+        <div className="pt-1 border-t border-gray-800 text-xs">
+          <span className="text-gray-600">Order hash </span>
+          <span className="text-cyan-500 font-mono" title={trade.order_hash}>
+            {shortHash(trade.order_hash, 14)}
+          </span>
+        </div>
+      )}
 
       <div className="flex items-center justify-between pt-2 border-t border-gray-800">
         <span className="text-gray-600 text-xs">{fmt(trade.timestamp)}</span>

@@ -7,6 +7,10 @@ const nextConfig = {
         source:      '/api/trades/:path*',
         destination: 'http://localhost:4000/trades/:path*',
       },
+      {
+        source:      '/api/wallet',
+        destination: 'http://localhost:4000/wallet',
+      },
     ];
   },
 };
