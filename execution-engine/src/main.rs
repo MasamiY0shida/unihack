@@ -141,6 +141,126 @@ struct PredictResponse {
     model_loaded:      bool,
 }
 
+// ── Sell policy configuration ─────────────────────────────────────────────────
+
+/// If market price moves this far against our entry, close the position.
+const STOP_LOSS_PP: f64 = 0.15;
+
+/// Once unrealised gain exceeds this, activate trailing stop.
+const TRAILING_ACTIVATE_PP: f64 = 0.10;
+
+/// After trailing stop activates, sell if price drops this far from peak.
+const TRAILING_DROP_PP: f64 = 0.05;
+
+/// Close all positions when fewer than this many seconds remain in the game
+/// to avoid binary resolution coin-flip risk.
+const TIME_DECAY_SECS: f64 = 120.0;
+
+// ── Position tracking ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct OpenPosition {
+    /// condition_id of the Polymarket market.
+    condition_id: String,
+    /// Token we bought (its token_id).
+    token_id:     String,
+    /// Team name we bet on.
+    team_name:    String,
+    /// "BUY_HOME" or "BUY_AWAY" — which side we hold.
+    #[allow(dead_code)]
+    side_label:   String,
+    /// True if we bought the home outcome.
+    bought_home:  bool,
+    /// Market price at time of entry (home-win implied prob).
+    entry_price:  f64,
+    /// Best market price seen since entry (for trailing stop).
+    peak_price:   f64,
+    /// Model prob at time of entry.
+    entry_model:  f64,
+    /// Timestamp of entry.
+    #[allow(dead_code)]
+    entered_at:   chrono::DateTime<Utc>,
+}
+
+#[derive(Debug)]
+enum SellReason {
+    EdgeFlip { old_edge: f64, new_edge: f64 },
+    StopLoss { entry: f64, current: f64 },
+    TrailingStop { peak: f64, current: f64 },
+    TimeDecay { seconds_left: f64 },
+}
+
+impl std::fmt::Display for SellReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SellReason::EdgeFlip { old_edge, new_edge } =>
+                write!(f, "EDGE_FLIP(was {:+.3} now {:+.3})", old_edge, new_edge),
+            SellReason::StopLoss { entry, current } =>
+                write!(f, "STOP_LOSS(entry {:.3} now {:.3})", entry, current),
+            SellReason::TrailingStop { peak, current } =>
+                write!(f, "TRAILING_STOP(peak {:.3} now {:.3})", peak, current),
+            SellReason::TimeDecay { seconds_left } =>
+                write!(f, "TIME_DECAY({:.0}s left)", seconds_left),
+        }
+    }
+}
+
+/// Check whether an open position should be sold.
+/// Returns Some(reason) if we should exit, None if we should hold.
+fn check_sell_triggers(
+    pos:             &OpenPosition,
+    current_price:   f64,      // current home-win market prob
+    model_prob:      f64,      // current model home-win prob
+    game_secs_left:  f64,
+    edge_confidence: f64,
+) -> Option<SellReason> {
+    // The "effective price" for our position:
+    // If we bought home, favourable = price goes up.
+    // If we bought away, favourable = price goes down (1 - price goes up).
+    let (our_entry, our_current, our_peak) = if pos.bought_home {
+        (pos.entry_price, current_price, pos.peak_price)
+    } else {
+        (1.0 - pos.entry_price, 1.0 - current_price, 1.0 - pos.peak_price)
+    };
+
+    // 1. Time decay — close before final buzzer
+    if game_secs_left < TIME_DECAY_SECS && game_secs_left > 0.0 {
+        return Some(SellReason::TimeDecay { seconds_left: game_secs_left });
+    }
+
+    // 2. Stop loss — market moved against us
+    if our_current < our_entry - STOP_LOSS_PP {
+        return Some(SellReason::StopLoss {
+            entry:   our_entry,
+            current: our_current,
+        });
+    }
+
+    // 3. Trailing stop — we were up, now giving it back
+    if our_peak >= our_entry + TRAILING_ACTIVATE_PP
+        && our_current < our_peak - TRAILING_DROP_PP
+    {
+        return Some(SellReason::TrailingStop {
+            peak:    our_peak,
+            current: our_current,
+        });
+    }
+
+    // 4. Edge flip — model now favours the other side with confidence
+    let old_edge = pos.entry_model - pos.entry_price;
+    let new_edge = model_prob - current_price;
+    let flipped = (old_edge > 0.0 && new_edge < -EDGE_THRESHOLD)
+               || (old_edge < 0.0 && new_edge > EDGE_THRESHOLD);
+    if flipped && edge_confidence >= 0.60 {
+        return Some(SellReason::EdgeFlip {
+            old_edge,
+            new_edge,
+        });
+    }
+
+    None
+}
+
 // ── In-memory registry ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -299,6 +419,60 @@ fn log_trade(
          market={market_prob:.3}  model={model_prob:.3}  \
          edge={:+.3}  stake={STAKE_USDC} USDC  hash={hash_snippet}",
         model_prob - market_prob,
+    );
+    Ok(())
+}
+
+/// Log a SELL trade — credits the wallet with proceeds based on current market price.
+fn log_sell_trade(
+    conn:         &Connection,
+    game_id:      &str,
+    target_team:  &str,
+    reason:       &SellReason,
+    entry_price:  f64,
+    exit_price:   f64,
+    model_prob:   f64,
+    signed_order: Option<&wallet::SignedOrder>,
+) -> Result<()> {
+    let id        = Uuid::new_v4().to_string();
+    let timestamp = Utc::now().to_rfc3339();
+    let action    = format!("SELL({})", reason);
+
+    let order_hash: Option<String> = signed_order.map(|s| s.order_hash.clone());
+    let signed_tx:  Option<String> = signed_order.map(|s| s.signed_tx.clone());
+
+    // PnL: proportional to price movement since entry
+    // If bought home at 0.40, now selling at 0.55 → profit = stake * (0.55/0.40 - 1)
+    let pnl = if entry_price > 0.001 {
+        STAKE_USDC * (exit_price / entry_price - 1.0)
+    } else {
+        0.0
+    };
+
+    conn.execute(
+        "INSERT INTO simulated_trades
+            (id, timestamp, game_id, target_team, action,
+             market_implied_prob, model_implied_prob, stake_amount, status, pnl,
+             order_hash, signed_tx)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'CLOSED', ?9, ?10, ?11)",
+        params![
+            id, timestamp, game_id, target_team, action,
+            exit_price, model_prob, STAKE_USDC, pnl,
+            order_hash, signed_tx
+        ],
+    )?;
+
+    // Credit wallet: original stake + pnl
+    let balance_delta = STAKE_USDC + pnl;
+    conn.execute(
+        "UPDATE wallet_state SET usdc_balance = usdc_balance + ?1 WHERE id = 1",
+        params![balance_delta],
+    )?;
+
+    info!(
+        "TRADE SOLD  id={id}  game={game_id}  reason={reason}  \
+         entry={entry_price:.3}  exit={exit_price:.3}  \
+         pnl={pnl:+.2} USDC  wallet_delta={balance_delta:+.2}",
     );
     Ok(())
 }
@@ -706,8 +880,11 @@ async fn run_ws_ingestion(
         std::collections::HashMap::new();
     let mut all_token_ids: Vec<String> = Vec::new();
 
+    // Open positions keyed by condition_id (one position per game)
+    let mut positions: std::collections::HashMap<String, OpenPosition> =
+        std::collections::HashMap::new();
+
     for m in &markets {
-        // Resolve home/away team IDs for this market
         let home_tid = m.tokens.iter().find(|t| t.is_home).and_then(|t| t.team_id);
         let away_tid = m.tokens.iter().find(|t| !t.is_home).and_then(|t| t.team_id);
 
@@ -747,7 +924,7 @@ async fn run_ws_ingestion(
     let sub      = WsSubscribe { msg_type: "subscribe", channel: "price_change", assets_ids: all_token_ids };
     let sub_json = serde_json::to_string(&sub)?;
     ws_stream.send(Message::Text(sub_json)).await?;
-    info!("Subscription sent");
+    info!("Subscription sent — tracking {} open positions", positions.len());
 
     while let Some(msg) = ws_stream.next().await {
         let msg = match msg {
@@ -841,6 +1018,63 @@ async fn run_ws_ingestion(
             let model_prob = resp.win_probability;
             let edge = model_prob - market_prob;
 
+            // ── SELL CHECK: do we have an open position on this game? ────
+            let mut should_sell: Option<(SellReason, OpenPosition)> = None;
+
+            if let Some(pos) = positions.get_mut(&entry.condition_id) {
+                // Update peak price (stored as home-win prob) for trailing stop
+                if pos.bought_home && market_prob > pos.peak_price {
+                    pos.peak_price = market_prob;
+                } else if !pos.bought_home && market_prob < pos.peak_price {
+                    pos.peak_price = market_prob;
+                }
+
+                if let Some(reason) = check_sell_triggers(
+                    pos, market_prob, model_prob, secs_left, resp.edge_confidence,
+                ) {
+                    should_sell = Some((reason, pos.clone()));
+                }
+            }
+
+            if let Some((reason, pos)) = should_sell {
+                info!(
+                    "SELL SIGNAL  game=\"{}\"  reason={}  positions_open={}",
+                    entry.question, reason, positions.len()
+                );
+
+                let exit_price = if pos.bought_home { market_prob } else { 1.0 - market_prob };
+                let sell_entry = if pos.bought_home { pos.entry_price } else { 1.0 - pos.entry_price };
+
+                let signed = wallet.sign_order(
+                    &pos.token_id, market_prob, STAKE_USDC, wallet::Side::Sell,
+                ).ok();
+
+                let db_guard = db.lock().await;
+                if let Err(e) = log_sell_trade(
+                    &db_guard,
+                    &pos.condition_id,
+                    &pos.team_name,
+                    &reason,
+                    sell_entry,
+                    exit_price,
+                    model_prob,
+                    signed.as_ref(),
+                ) {
+                    error!("DB sell write failed: {e}");
+                }
+                drop(db_guard);
+
+                positions.remove(&entry.condition_id);
+                info!("Position closed — {} open positions remaining", positions.len());
+                continue;
+            }
+
+            // If we have a position but no sell signal, skip (don't stack trades)
+            if positions.contains_key(&entry.condition_id) {
+                continue;
+            }
+
+            // ── BUY CHECK: no open position, look for edge ──────────────
             if edge.abs() < EDGE_THRESHOLD { continue; }
             if resp.edge_confidence < 0.60 {
                 info!(
@@ -850,7 +1084,8 @@ async fn run_ws_ingestion(
                 continue;
             }
 
-            let action = if edge > 0.0 {
+            let bought_home = edge > 0.0;
+            let action = if bought_home {
                 format!("BUY_{}", entry.team_name.to_uppercase().replace(' ', "_"))
             } else {
                 "BUY_AWAY".to_string()
@@ -861,8 +1096,8 @@ async fn run_ws_ingestion(
                 entry.question, entry.team_name, resp.edge_confidence * 100.0
             );
 
-            // Sign the order before logging
-            let side = if edge > 0.0 { wallet::Side::Buy } else { wallet::Side::Buy };
+            // Sign the buy order
+            let side = if bought_home { wallet::Side::Buy } else { wallet::Side::Buy };
             let signed = wallet.sign_order(&entry.token_id, market_prob, STAKE_USDC, side).ok();
 
             if signed.is_none() {
@@ -881,6 +1116,21 @@ async fn run_ws_ingestion(
             ) {
                 error!("DB write failed: {e}");
             }
+            drop(db_guard);
+
+            // Track the open position
+            positions.insert(entry.condition_id.clone(), OpenPosition {
+                condition_id: entry.condition_id.clone(),
+                token_id:     entry.token_id.clone(),
+                team_name:    entry.team_name.clone(),
+                side_label:   action,
+                bought_home,
+                entry_price:  market_prob,
+                peak_price:   market_prob,
+                entry_model:  model_prob,
+                entered_at:   Utc::now(),
+            });
+            info!("Position opened — {} open positions total", positions.len());
         }
     }
 
