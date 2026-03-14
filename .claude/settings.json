@@ -5,7 +5,13 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''server.py''\\).read\\(\\)\\); print\\(''server.py syntax OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''model_v2.py''\\).read\\(\\)\\); print\\(''model_v2.py syntax OK''\\)\")",
       "Bash($HOME/.cargo/bin/cargo check:*)",
-      "Bash($HOME/.cargo/bin/cargo test:*)"
+      "Bash($HOME/.cargo/bin/cargo test:*)",
+      "Bash(find /Users/masamiyoshida/Documents/unihack -maxdepth 2 -name *.py)",
+      "Bash(python3 -c \":*)",
+      "Bash(source /Users/masamiyoshida/Documents/unihack/venv/bin/activate)",
+      "Bash(grep -r \"points_in_the_paint\\\\|fast_break\\\\|second_chance\\\\|bench\\\\|biggest_lead\\\\|pts_paint\\\\|fbp\\\\|scp\\\\|pot\" /Users/masamiyoshida/Documents/unihack/*.py)",
+      "Bash(grep -r \"boxscore\\\\|pts_paint\\\\|bench_pts\\\\|biggest_lead\" /Users/masamiyoshida/Documents/unihack/*.py)",
+      "Bash(./venv/bin/python -c \":*)"
     ]
   }
 }

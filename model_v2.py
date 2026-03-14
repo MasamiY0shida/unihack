@@ -36,13 +36,17 @@ def load_all_data():
         "off_court": "player_off_court.parquet",
         "pbp": "play_by_play.parquet",
         "comebacks": "comeback_profiles.parquet",
+        "boxscore_adv": "boxscore_advanced.parquet",
     }
     for key, filename in files.items():
         try:
             data[key] = pd.read_parquet(f"{DATA_DIR}/{filename}")
             print(f"  Loaded {key}: {len(data[key])} rows")
         except FileNotFoundError:
-            print(f"  WARNING: {filename} not found")
+            if key == "boxscore_adv":
+                print(f"  INFO: {filename} not found — run fetch_boxscores.py to populate")
+            else:
+                print(f"  WARNING: {filename} not found")
             data[key] = pd.DataFrame()
     return data
 
@@ -641,6 +645,124 @@ def enrich_snapshots_with_boxscore(snapshots, pbp, games):
 
 
 # ══════════════════════════════════════════════
+# SECTION 4c: OVERLAY HISTORICAL BOXSCORE DATA
+#   Replace zero-constant LIVE_* features with
+#   real values from NBA Stats API, interpolated
+#   by game progress.
+# ══════════════════════════════════════════════
+
+def overlay_historical_boxscore(snapshots, boxscore_adv, games):
+    """
+    Replace the ~15 LIVE_* features that were zero (because PBP can't
+    compute them) with real historical boxscore data scaled by game progress.
+
+    Cumulative stats (pts_paint, bench_pts, etc.) are linearly interpolated:
+        mid_game_value ≈ final_game_value × game_progress
+
+    This is approximate but much better than zero — the model can learn
+    the relationship between these features and outcomes.
+    """
+    if boxscore_adv.empty:
+        print("  No boxscore_advanced data — skipping overlay")
+        return snapshots
+
+    # Build home/away team maps from games data
+    home_map = (
+        games[games["MATCHUP"].str.contains("vs.", na=False)]
+        [["GAME_ID", "TEAM_ID"]]
+        .drop_duplicates("GAME_ID")
+        .set_index("GAME_ID")["TEAM_ID"]
+        .to_dict()
+    )
+
+    # Build lookup: (GAME_ID) → boxscore row
+    bs_lookup = {}
+    for _, row in boxscore_adv.iterrows():
+        bs_lookup[row["GAME_ID"]] = row
+
+    # Column mappings: (boxscore_col_prefix, live_feature_name)
+    # These are cumulative stats that scale with game progress
+    cumulative_maps = [
+        ("PTS_PAINT",     "PTS_PAINT"),
+        ("PTS_FASTBREAK", "PTS_FASTBREAK"),
+        ("PTS_2ND",       "PTS_2ND"),
+        ("PTS_OFF_TO",    "PTS_OFF_TO"),
+        ("BENCH_PTS",     "BENCH_PTS"),
+    ]
+    # These scale with game progress but are rate-like (noisier)
+    rate_maps = [
+        ("STAR_PM",         "STAR_PM"),
+        ("STAR_MINS_TOTAL", "STAR_MINS"),
+        ("LINEUP_PM",       "LINEUP_PM"),
+    ]
+
+    filled = 0
+    total_games = snapshots["GAME_ID"].nunique()
+
+    for game_id in snapshots["GAME_ID"].unique():
+        bs = bs_lookup.get(game_id)
+        if bs is None:
+            continue
+
+        home_id = home_map.get(game_id)
+        if home_id is None:
+            continue
+
+        mask = snapshots["GAME_ID"] == game_id
+        progress = snapshots.loc[mask, "GAME_PROGRESS"].values
+        # Clamp progress to [0.01, 1.0] to avoid multiplication by 0
+        progress = np.clip(progress, 0.01, 1.0)
+
+        # Determine which side is home/away in the boxscore data
+        bs_home_id = bs.get("HOME_TEAM_ID", 0)
+        if bs_home_id == home_id:
+            home_prefix, away_prefix = "HOME", "AWAY"
+        else:
+            home_prefix, away_prefix = "AWAY", "HOME"
+
+        # Fill cumulative features (scaled by game progress)
+        for bs_suffix, live_suffix in cumulative_maps:
+            for side, bs_side in [("HOME", home_prefix), ("AWAY", away_prefix)]:
+                col = f"LIVE_{side}_{live_suffix}"
+                bs_col = f"{bs_side}_{bs_suffix}"
+                if col in snapshots.columns and bs_col in bs.index:
+                    final_val = float(bs[bs_col])
+                    snapshots.loc[mask, col] = final_val * progress
+
+        # Fill rate/PM features (also scaled, noisier but better than 0)
+        for bs_suffix, live_suffix in rate_maps:
+            for side, bs_side in [("HOME", home_prefix), ("AWAY", away_prefix)]:
+                col = f"LIVE_{side}_{live_suffix}"
+                bs_col = f"{bs_side}_{bs_suffix}"
+                if col in snapshots.columns and bs_col in bs.index:
+                    final_val = float(bs[bs_col])
+                    snapshots.loc[mask, col] = final_val * progress
+
+        # Recompute differentials that were hardcoded to 0
+        snapshots.loc[mask, "LIVE_DIFF_PTS_PAINT"] = (
+            snapshots.loc[mask, "LIVE_HOME_PTS_PAINT"].values
+            - snapshots.loc[mask, "LIVE_AWAY_PTS_PAINT"].values
+        )
+        snapshots.loc[mask, "LIVE_DIFF_PTS_2ND"] = (
+            snapshots.loc[mask, "LIVE_HOME_PTS_2ND"].values
+            - snapshots.loc[mask, "LIVE_AWAY_PTS_2ND"].values
+        )
+        snapshots.loc[mask, "LIVE_DIFF_BENCH_PTS"] = (
+            snapshots.loc[mask, "LIVE_HOME_BENCH_PTS"].values
+            - snapshots.loc[mask, "LIVE_AWAY_BENCH_PTS"].values
+        )
+        snapshots.loc[mask, "LIVE_DIFF_LINEUP_PM"] = (
+            snapshots.loc[mask, "LIVE_HOME_LINEUP_PM"].values
+            - snapshots.loc[mask, "LIVE_AWAY_LINEUP_PM"].values
+        )
+
+        filled += 1
+
+    print(f"  Overlaid historical boxscore data for {filled}/{total_games} games")
+    return snapshots
+
+
+# ══════════════════════════════════════════════
 # SECTION 5: MERGE ALL FEATURES
 # ══════════════════════════════════════════════
 
@@ -1203,6 +1325,13 @@ if __name__ == "__main__":
     # ── Boxscore enrichment from PBP ──
     print("\n[5/10] Reconstructing live boxscore stats from PBP...")
     snapshots = enrich_snapshots_with_boxscore(snapshots, data["pbp"], data["games"])
+
+    # ── Overlay historical boxscore data (replaces zero-constant features) ──
+    if not data["boxscore_adv"].empty:
+        print("\n[5b/10] Overlaying historical boxscore data...")
+        snapshots = overlay_historical_boxscore(
+            snapshots, data["boxscore_adv"], data["games"]
+        )
 
     # ── Merge everything ──
     print("\n[6/10] Merging all features...")

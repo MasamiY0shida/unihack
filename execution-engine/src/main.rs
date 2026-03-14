@@ -5,7 +5,9 @@
 //  Flow:
 //    1. Query Polymarket REST API → discover live NBA markets
 //    2. Open WebSocket to Polymarket CLOB → stream price ticks
-//    3. On each tick → ask Alpha Engine for model probability
+//    3. On each tick → query server.py for full v2 model predictions
+//       (265-feature pipeline with live boxscore, momentum, lag features)
+//       Falls back to alpha-engine if server.py doesn't track the game.
 //    4. If |model_prob - market_prob| > EDGE_THRESHOLD →
 //         a. Build a Polymarket CLOB order and sign it (EIP-712, test key)
 //         b. Log signed trade to SQLite, deduct fake USDC from wallet
@@ -139,6 +141,17 @@ struct PredictResponse {
     #[allow(dead_code)]
     kelly_size:        f64,
     model_loaded:      bool,
+}
+
+// ── server.py combined prediction (full v2 pipeline with all 265 features) ───
+
+/// Predictions extracted from server.py GET /games response.
+/// These use the full feature pipeline (boxscore, momentum, lag) unlike the
+/// alpha-engine fallback which only receives 6 fields.
+struct ServerPrediction {
+    game_seconds_left: f64,
+    win_probability:   f64,
+    edge_confidence:   f64,
 }
 
 // ── Sell policy configuration ─────────────────────────────────────────────────
@@ -823,22 +836,16 @@ async fn get_model_prob(http: &Client, gs: &GameStateRequest) -> Result<f64> {
     Ok(resp.win_probability)
 }
 
-/// Query server.py for the current live game state matching these team IDs.
-async fn get_live_game_state(
-    http: &Client,
+/// Search pre-fetched server.py /games JSON for a game matching these team IDs.
+/// Returns full predictions from the v2 pipeline (265 features, boxscore, momentum).
+fn find_server_prediction(
+    games_data: &serde_json::Value,
     home_team_id: i64,
     away_team_id: i64,
-) -> Option<(i32, f64, f64, f64)> {
-    // Returns (period, game_seconds_left, home_score, away_score)
-    let resp = http.get(format!("{SERVER_URL}/games"))
-        .send().await.ok()?;
-    if !resp.status().is_success() { return None; }
-
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let games = data.get("games")?.as_array()?;
+) -> Option<ServerPrediction> {
+    let games = games_data.get("games")?.as_array()?;
 
     for game in games {
-        // Match by team IDs exposed by server.py
         let g_home = game.get("home_team_id")?.as_i64()?;
         let g_away = game.get("away_team_id")?.as_i64()?;
 
@@ -846,11 +853,8 @@ async fn get_live_game_state(
             continue;
         }
 
-        let score = game.get("score")?;
+        // Extract game clock for seconds-left computation
         let period = game.get("period")?.as_i64()? as i32;
-        let home_score = score.get("home")?.as_f64()?;
-        let away_score = score.get("away")?.as_f64()?;
-
         let game_clock = game.get("game_clock").and_then(|v| v.as_str()).unwrap_or("");
         let game_seconds_left = {
             let clock = game_clock.replace("PT", "").replace("S", "");
@@ -861,7 +865,16 @@ async fn get_live_game_state(
             remaining_periods * 720.0 + mins * 60.0 + secs
         };
 
-        return Some((period, game_seconds_left, home_score, away_score));
+        // Extract full v2 predictions
+        let preds = game.get("predictions")?;
+        let win_probability = preds.get("win_probability")?.as_f64()?;
+        let edge_confidence = preds.get("edge_confidence")?.as_f64()?;
+
+        return Some(ServerPrediction {
+            game_seconds_left,
+            win_probability,
+            edge_confidence,
+        });
     }
 
     None
@@ -1059,6 +1072,15 @@ async fn run_ws_ingestion(
             vec![raw]
         };
 
+        // Fetch server.py /games once per WS message (covers all ticks in batch)
+        let server_games: Option<serde_json::Value> = match http
+            .get(format!("{SERVER_URL}/games"))
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => r.json().await.ok(),
+            _ => None,
+        };
+
         for tick_val in ticks {
             let event_type = tick_val
                 .get("event_type").or_else(|| tick_val.get("type"))
@@ -1088,38 +1110,37 @@ async fn run_ws_ingestion(
             // Only process home token — gives P(home wins) directly.
             if !entry.is_home { continue; }
 
-            // Resolve team IDs (required for v2 alpha-engine)
+            // Resolve team IDs
             let home_tid = entry.home_team_id.unwrap_or(0);
             let away_tid = entry.away_team_id.unwrap_or(0);
 
-            // Try to get live game state from server.py
-            let (period, secs_left, home_score, away_score) =
-                get_live_game_state(&http, home_tid, away_tid)
-                    .await
-                    .unwrap_or((1, 2880.0, 0.0, 0.0));
+            // ── Tier 1: Use server.py full v2 predictions (265 features) ─────
+            // ── Tier 2: Fall back to alpha-engine (6 fields, ~93 features zero)
+            let (model_prob, secs_left, edge_confidence) =
+                if let Some(sp) = server_games.as_ref()
+                    .and_then(|g| find_server_prediction(g, home_tid, away_tid))
+                {
+                    (sp.win_probability, sp.game_seconds_left, sp.edge_confidence)
+                } else {
+                    // Alpha-engine fallback (limited feature set)
+                    let game_state = GameStateRequest {
+                        home_team_id: home_tid, away_team_id: away_tid,
+                        period: 1, game_seconds_left: 2880.0,
+                        home_score: 0.0, away_score: 0.0,
+                    };
+                    match http
+                        .post(format!("{ALPHA_ENGINE_URL}/predict"))
+                        .json(&game_state)
+                        .send().await
+                    {
+                        Ok(r) => match r.json::<PredictResponse>().await {
+                            Ok(p) => (p.win_probability, 2880.0, p.edge_confidence),
+                            Err(e) => { warn!("Alpha Engine deserialise error: {e}"); continue; }
+                        },
+                        Err(e) => { warn!("Alpha Engine error: {e}"); continue; }
+                    }
+                };
 
-            let game_state = GameStateRequest {
-                home_team_id:      home_tid,
-                away_team_id:      away_tid,
-                period,
-                game_seconds_left: secs_left,
-                home_score,
-                away_score,
-            };
-
-            let resp = match http
-                .post(format!("{ALPHA_ENGINE_URL}/predict"))
-                .json(&game_state)
-                .send().await
-            {
-                Ok(r) => match r.json::<PredictResponse>().await {
-                    Ok(p)  => p,
-                    Err(e) => { warn!("Alpha Engine deserialise error: {e}"); continue; }
-                },
-                Err(e) => { warn!("Alpha Engine error: {e}"); continue; }
-            };
-
-            let model_prob = resp.win_probability;
             let edge = model_prob - market_prob;
 
             // ── SELL CHECK: do we have an open position on this game? ────
@@ -1134,7 +1155,7 @@ async fn run_ws_ingestion(
                 }
 
                 if let Some(reason) = check_sell_triggers(
-                    pos, market_prob, model_prob, secs_left, resp.edge_confidence,
+                    pos, market_prob, model_prob, secs_left, edge_confidence,
                 ) {
                     should_sell = Some((reason, pos.clone()));
                 }
@@ -1200,10 +1221,10 @@ async fn run_ws_ingestion(
             //   edge > threshold  → model says home is underpriced → buy home token
             //   edge < -threshold → model says home is overpriced  → buy away token
             if edge.abs() < EDGE_THRESHOLD { continue; }
-            if resp.edge_confidence < 0.60 {
+            if edge_confidence < 0.60 {
                 info!(
                     "Edge {edge:+.3} found but confidence too low ({:.1}%) — skipping",
-                    resp.edge_confidence * 100.0
+                    edge_confidence * 100.0
                 );
                 continue;
             }
@@ -1224,7 +1245,7 @@ async fn run_ws_ingestion(
 
             info!(
                 "EDGE FOUND  game=\"{}\"  home={}  edge={edge:+.3}  conf={:.1}%  action={action}",
-                entry.question, entry.team_name, resp.edge_confidence * 100.0
+                entry.question, entry.team_name, edge_confidence * 100.0
             );
 
             // Sign the buy order — Buy for home token, Sell for away (short home)
@@ -1373,14 +1394,24 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { settle_trades(db_settle, http_settle).await; });
     }
 
-    // ── Check Alpha Engine
+    // ── Check server.py (primary prediction source — full v2 pipeline)
+    match http.get(format!("{SERVER_URL}/health")).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            info!("server.py healthy (primary predictions): {body}");
+        }
+        Ok(r)  => warn!("server.py HTTP {} — will fall back to alpha-engine", r.status()),
+        Err(e) => warn!("server.py unreachable ({e}) — will fall back to alpha-engine"),
+    }
+
+    // ── Check Alpha Engine (fallback when server.py doesn't track a game)
     match http.get(format!("{ALPHA_ENGINE_URL}/health")).send().await {
         Ok(r) if r.status().is_success() => {
             let body: serde_json::Value = r.json().await.unwrap_or_default();
-            info!("Alpha Engine healthy: {body}");
+            info!("Alpha Engine healthy (fallback): {body}");
         }
         Ok(r)  => warn!("Alpha Engine HTTP {}", r.status()),
-        Err(e) => warn!("Alpha Engine unreachable ({e}) — naive prior will be used"),
+        Err(e) => warn!("Alpha Engine unreachable ({e}) — no fallback available"),
     }
 
     // ── Market discovery + WebSocket ingestion (retry loop)
