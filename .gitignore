@@ -1,6 +1,45 @@
-data/*.parquet
-data/*.csv
-data/*.json
+# ── Python ──────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+*.parquet
+data/
+
+# ── Rust ────────────────────────────────────────
+target/
+Cargo.lock
+**/*.rs.bk
+
+# ── Node / Next.js ──────────────────────────────
+node_modules/
+.next/
+out/
 .DS_Store
+*.tsbuildinfo
+.vercel
+
+# ── Database ────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+
+# ── Environment / secrets ───────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── IDE ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
