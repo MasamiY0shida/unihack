@@ -794,3 +794,88 @@ mod tests {
         assert_eq!(bal_after, new_bal);
     }
 }
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("execution_engine=info".parse()?)
+                .add_directive("info".parse()?),
+        )
+        .init();
+
+    info!("NBA Execution Engine v2 (testnet signing) starting…");
+
+    // ── Wallet
+    let wallet = Arc::new(
+        wallet::TestWallet::new().context("failed to initialise test wallet")?
+    );
+    info!("Test wallet address : {}", wallet.address);
+    info!("Chain               : Polygon (ID {}) — no real funds", wallet::CHAIN_ID);
+
+    // ── Database
+    let conn = Connection::open(DB_PATH).context("open SQLite")?;
+    init_db(&conn)?;
+    init_wallet_state(&conn, &wallet.address)?;
+    let db = Arc::new(Mutex::new(conn));
+
+    // ── HTTP client
+    let http = Client::builder()
+        .user_agent("nba-execution-engine/2.0")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    // ── Shared app state
+    let app_state = AppState { db: Arc::clone(&db), wallet: Arc::clone(&wallet) };
+
+    // ── Spawn HTTP API server (port 4000)
+    {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_http_server(state).await {
+                error!("HTTP server error: {e}");
+            }
+        });
+    }
+
+    // ── Spawn trade settlement (every 5 min)
+    {
+        let db_settle   = Arc::clone(&db);
+        let http_settle = http.clone();
+        tokio::spawn(async move { settle_trades(db_settle, http_settle).await; });
+    }
+
+    // ── Check Alpha Engine
+    match http.get(format!("{ALPHA_ENGINE_URL}/health")).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            info!("Alpha Engine healthy: {body}");
+        }
+        Ok(r)  => warn!("Alpha Engine HTTP {}", r.status()),
+        Err(e) => warn!("Alpha Engine unreachable ({e}) — naive prior will be used"),
+    }
+
+    // ── Market discovery + WebSocket ingestion (retry loop)
+    loop {
+        let markets = fetch_nba_markets(&http).await.unwrap_or_else(|e| {
+            error!("Market discovery failed: {e}");
+            vec![]
+        });
+
+        if markets.is_empty() {
+            warn!("No active NBA markets on Polymarket — retrying in 60 s…");
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            continue;
+        }
+
+        info!("(Re)connecting WebSocket ingestion loop…");
+        match run_ws_ingestion(markets, http.clone(), Arc::clone(&db), Arc::clone(&wallet)).await {
+            Ok(_)  => warn!("WS loop exited cleanly — reconnecting in 5 s"),
+            Err(e) => error!("WS loop error: {e} — reconnecting in 5 s"),
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
+}
