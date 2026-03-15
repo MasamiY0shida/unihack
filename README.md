@@ -43,7 +43,7 @@ pip install pyarrow
 ## 1 — Live Game Server (Python · port 8000)
 
 ```bash
-./venv/bin/python -m uvicorn server:app --reload --port 8000
+./venv/bin/python -m uvicorn server:app --port 8000
 ```
 
 Polls the NBA live API for scores and game state. The Execution Engine reads from this.
@@ -77,9 +77,10 @@ Optional env vars:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RUST_LOG` | `info` | Log level (`debug` for verbose) |
+| `RUST_LOG` | `info` | Log level (`debug` for verbose output) |
 
 ```bash
+cd execution-engine
 RUST_LOG=debug cargo run --release
 ```
 
