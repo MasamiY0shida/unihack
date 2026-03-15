@@ -132,7 +132,7 @@ def record_snapshot(game_id, game_state, predictions, market_odds, feature_vecto
         predictions.get("edge"),
         predictions.get("edge_confidence"),
         predictions.get("kelly_size"),
-        json.dumps(feature_vector) if feature_vector else None,
+        json.dumps(feature_vector, default=lambda x: float(x) if hasattr(x, 'item') else str(x)) if feature_vector else None,
     ))
     db.commit()
     db.close()

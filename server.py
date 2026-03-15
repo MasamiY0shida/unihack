@@ -58,6 +58,14 @@ class ModelSuite:
         proxy_prob = float(self.proxy_model.predict_proba(pregame_arr)[0][1])
         margin_pred = float(self.margin_model.predict(live_arr)[0])
 
+        # Clamp extreme predictions based on game progress.
+        # Early in a game, small sample live stats (e.g. 2/2 FG = 100%) push
+        # the model to unrealistic extremes. Cap max confidence by progress:
+        # Q1 start ~65%, Q2 end ~82%, Q3 end ~93%, Q4 ~99%.
+        gp = features.get("GAME_PROGRESS", 0.5)
+        max_prob = min(0.99, 0.65 + gp * 0.34)
+        win_prob = max(1.0 - max_prob, min(max_prob, win_prob))
+
         edge = win_prob - proxy_prob
         abs_edge = abs(edge)
 
@@ -495,6 +503,7 @@ async def poll_live_games():
                       f"{len(active_ids)} live games")
 
             for game_id in active_ids:
+              try:
                 state = tracker.get_game_state(game_id)
                 if not state:
                     continue
@@ -512,7 +521,9 @@ async def poll_live_games():
                 market_prob, market = _match_market_prob(state)
 
                 # Generate signals using real market odds when available
-                signals = signal_gen.generate(predictions, state, market_prob=market_prob)
+                signals = signal_gen.generate(
+                    predictions, state, market_prob=market_prob
+                )
 
                 # Package everything
                 market_edge = (predictions["win_probability"] - market_prob) if market_prob is not None else None
@@ -577,6 +588,8 @@ async def poll_live_games():
                     print(f"  {home} vs {away} ({score} Q{state['period']}) | "
                           f"Edge: {edge_pct:.1f}% (proxy) | Conf: {conf:.1f}% | "
                           f"Signals: {len(signals)}")
+              except Exception as game_err:
+                print(f"  Game {game_id} error: {game_err}")
 
             # Check for completed games and finalize outcomes
             completed = tracker.check_completed_games(sb_data)
