@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ComposedChart, Area, Line, XAxis, YAxis,
   Tooltip, Legend, ResponsiveContainer, ReferenceLine,
@@ -75,14 +75,32 @@ function shortHash(h: string | null, len = 10): string {
 
 type Tab = "overview" | "live" | "positions" | "history" | "analytics";
 
+interface FeedEvent {
+  id:        string;
+  type:      "NBA_DATA" | "ML_PREDICTION" | "TRADE";
+  message:   string;
+  detail:    string;
+  timestamp: Date;
+}
+
+interface ToastNotification {
+  id:    string;
+  trade: Trade;
+}
+
 export default function Dashboard() {
-  const [trades, setTrades]         = useState<Trade[]>([]);
-  const [wallet, setWallet]         = useState<WalletInfo | null>(null);
-  const [liveGames, setLiveGames]   = useState<LiveGame[]>([]);
-  const [loading, setLoading]       = useState(true);
+  const [trades, setTrades]           = useState<Trade[]>([]);
+  const [wallet, setWallet]           = useState<WalletInfo | null>(null);
+  const [liveGames, setLiveGames]     = useState<LiveGame[]>([]);
+  const [loading, setLoading]         = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [connected, setConnected]   = useState(false);
-  const [activeTab, setActiveTab]   = useState<Tab>("overview");
+  const [connected, setConnected]     = useState(false);
+  const [activeTab, setActiveTab]     = useState<Tab>("overview");
+  const [feedEvents, setFeedEvents]   = useState<FeedEvent[]>([]);
+  const [toasts, setToasts]           = useState<ToastNotification[]>([]);
+  const prevTradesRef  = useRef<Trade[]>([]);
+  const prevGamesRef   = useRef<LiveGame[]>([]);
+  const isFirstPollRef = useRef(true);
 
   useEffect(() => {
     const fetchAll = async () => {
@@ -91,19 +109,128 @@ export default function Dashboard() {
           fetch("/api/trades"),
           fetch("/api/wallet"),
         ]);
-        setTrades(await tradesRes.json());
+        const newTrades: Trade[] = await tradesRes.json();
+        setTrades(newTrades);
         setWallet(await walletRes.json());
 
         // Fetch live games from server.py (non-blocking — may not be running)
+        let newGames: LiveGame[] = [];
         try {
           const gamesRes = await fetch("/api/games");
           if (gamesRes.ok) {
             const data = await gamesRes.json();
-            setLiveGames(data.games ?? []);
+            newGames = data.games ?? [];
+            setLiveGames(newGames);
           }
         } catch { /* server.py may not be running */ }
 
-        setLastUpdated(new Date());
+        const now = new Date();
+
+        if (!isFirstPollRef.current) {
+          const newEvents: FeedEvent[] = [];
+
+          // ── Detect new trades ──
+          const prevIds = new Set(prevTradesRef.current.map(t => t.id));
+          for (const trade of newTrades) {
+            if (!prevIds.has(trade.id)) {
+              const edge = (trade.model_implied_prob - trade.market_implied_prob) * 100;
+              newEvents.push({
+                id:        `trade-${trade.id}`,
+                type:      "TRADE",
+                message:   `${trade.action}  ${trade.target_team}`,
+                detail:    `${edge >= 0 ? "+" : ""}${edge.toFixed(1)}% edge · $${trade.stake_amount} staked`,
+                timestamp: now,
+              });
+              // Toast for each new trade (auto-dismiss after 6s)
+              const toastId = `toast-${trade.id}`;
+              setToasts(prev => [...prev, { id: toastId, trade }]);
+              setTimeout(() => setToasts(prev => prev.filter(t => t.id !== toastId)), 6000);
+            }
+          }
+
+          // ── Detect live game changes ──
+          const prevGamesMap = new Map(prevGamesRef.current.map(g => [g.game_id, g]));
+          for (const game of newGames) {
+            const prev = prevGamesMap.get(game.game_id);
+            if (!prev) {
+              // New game appeared
+              newEvents.push({
+                id:        `nba-new-${game.game_id}-${now.getTime()}`,
+                type:      "NBA_DATA",
+                message:   `${game.home_team} vs ${game.away_team}`,
+                detail:    `New game tracked · Q${game.period} · ${game.score.home}–${game.score.away}`,
+                timestamp: now,
+              });
+              newEvents.push({
+                id:        `pred-new-${game.game_id}-${now.getTime()}`,
+                type:      "ML_PREDICTION",
+                message:   `${game.home_team} win prob ${(game.predictions.win_probability * 100).toFixed(1)}%`,
+                detail:    `edge ${game.predictions.edge >= 0 ? "+" : ""}${(game.predictions.edge * 100).toFixed(1)}% · conf ${(game.predictions.edge_confidence * 100).toFixed(0)}%`,
+                timestamp: now,
+              });
+            } else {
+              // Score changed
+              if (prev.score.home !== game.score.home || prev.score.away !== game.score.away) {
+                newEvents.push({
+                  id:        `nba-score-${game.game_id}-${now.getTime()}`,
+                  type:      "NBA_DATA",
+                  message:   `${game.home_team} ${game.score.home}–${game.score.away} ${game.away_team}`,
+                  detail:    `Q${game.period} ${game.game_clock} · score update`,
+                  timestamp: now,
+                });
+              }
+              // Prediction shifted >0.5%
+              if (Math.abs(game.predictions.win_probability - prev.predictions.win_probability) > 0.005) {
+                const edgePct = game.predictions.edge * 100;
+                newEvents.push({
+                  id:        `pred-${game.game_id}-${now.getTime()}`,
+                  type:      "ML_PREDICTION",
+                  message:   `${game.home_team} win prob → ${(game.predictions.win_probability * 100).toFixed(1)}%`,
+                  detail:    `edge ${edgePct >= 0 ? "+" : ""}${edgePct.toFixed(1)}% · conf ${(game.predictions.edge_confidence * 100).toFixed(0)}%`,
+                  timestamp: now,
+                });
+              }
+            }
+          }
+
+          if (newEvents.length > 0) {
+            setFeedEvents(prev => [...newEvents, ...prev].slice(0, 50));
+          }
+        } else {
+          // First poll — seed the feed with a snapshot of current state
+          isFirstPollRef.current = false;
+          const initEvents: FeedEvent[] = [];
+          if (newGames.length > 0) {
+            initEvents.push({
+              id:        `init-pred-${now.getTime()}`,
+              type:      "ML_PREDICTION",
+              message:   `XGBoost models active · ${newGames.length} game${newGames.length > 1 ? "s" : ""} tracked`,
+              detail:    `265 features · 4 models per game`,
+              timestamp: now,
+            });
+            initEvents.push({
+              id:        `init-games-${now.getTime()}`,
+              type:      "NBA_DATA",
+              message:   newGames.map(g => `${g.home_team} vs ${g.away_team}`).join(" · "),
+              detail:    `NBA live scoreboard · polling every 30s`,
+              timestamp: now,
+            });
+          }
+          if (newTrades.length > 0) {
+            initEvents.push({
+              id:        `init-trades-${now.getTime()}`,
+              type:      "TRADE",
+              message:   `${newTrades.length} trade${newTrades.length > 1 ? "s" : ""} on record`,
+              detail:    `Latest: ${newTrades[0]?.target_team ?? "—"} · ${newTrades[0]?.action ?? ""}`,
+              timestamp: now,
+            });
+          }
+          if (initEvents.length > 0) setFeedEvents(initEvents);
+        }
+
+        prevTradesRef.current = newTrades;
+        prevGamesRef.current  = newGames;
+        setLastUpdated(now);
         setConnected(true);
       } catch {
         setConnected(false);
@@ -458,6 +585,12 @@ export default function Dashboard() {
               </section>
             )}
 
+            {/* Live Pipeline Feed */}
+            <section>
+              <SectionHeader label="System Pipeline Feed" count={-1} pulse color="text-green-400" />
+              <LivePipelineFeed events={feedEvents} />
+            </section>
+
             {/* Live signals summary */}
             {liveGames.length > 0 && (
               <section>
@@ -649,6 +782,9 @@ export default function Dashboard() {
         )}
 
       </div>
+
+      {/* Trade toast notifications — fixed bottom-right */}
+      <ToastStack toasts={toasts} onDismiss={(id) => setToasts(prev => prev.filter(t => t.id !== id))} />
     </main>
   );
 }
@@ -1006,5 +1142,109 @@ function StatusBadge({ status }: { status: string }) {
     <span className={`px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap ${styles[status] ?? "bg-gray-700 text-gray-300"}`}>
       {status}
     </span>
+  );
+}
+
+// ── Live Pipeline Feed ──
+
+const FEED_CONFIG = {
+  NBA_DATA:      { label: "NBA DATA",   textColor: "text-cyan-400",  dotColor: "bg-cyan-400"  },
+  ML_PREDICTION: { label: "ML MODEL",   textColor: "text-amber-400", dotColor: "bg-amber-400" },
+  TRADE:         { label: "TRADE",      textColor: "text-green-400", dotColor: "bg-green-400" },
+} as const;
+
+function LivePipelineFeed({ events }: { events: FeedEvent[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [events.length]);
+
+  if (events.length === 0) {
+    return (
+      <div className="bg-gray-900 border border-gray-800 rounded-lg h-48 flex items-center justify-center">
+        <p className="text-gray-600 text-xs">Waiting for system events…</p>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={scrollRef} className="bg-gray-900 border border-gray-800 rounded-lg overflow-y-auto h-56 divide-y divide-gray-800/50">
+      {events.map((ev, i) => {
+        const cfg = FEED_CONFIG[ev.type];
+        return (
+          <div
+            key={ev.id}
+            className={`flex items-start gap-3 px-4 py-2.5 text-xs ${i === 0 ? "bg-gray-800/50" : "hover:bg-gray-800/20"} transition-colors`}
+          >
+            <span className="text-gray-600 whitespace-nowrap pt-0.5 w-24 shrink-0 tabular-nums">
+              {ev.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+            </span>
+            <span className={`w-2 h-2 rounded-full mt-1 shrink-0 ${cfg.dotColor} ${i === 0 ? "animate-pulse" : ""}`} />
+            <span className={`font-bold uppercase tracking-wider shrink-0 w-20 ${cfg.textColor}`}>
+              {cfg.label}
+            </span>
+            <div className="min-w-0 leading-relaxed">
+              <span className="text-gray-200">{ev.message}</span>
+              {ev.detail && <span className="text-gray-500 ml-2">{ev.detail}</span>}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Trade Toast Notifications ──
+
+function ToastStack({
+  toasts,
+  onDismiss,
+}: {
+  toasts: ToastNotification[];
+  onDismiss: (id: string) => void;
+}) {
+  if (toasts.length === 0) return null;
+  return (
+    <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-3 pointer-events-none">
+      {toasts.map(toast => {
+        const edge  = (toast.trade.model_implied_prob - toast.trade.market_implied_prob) * 100;
+        const isBuy = toast.trade.action.startsWith("BUY");
+        return (
+          <div
+            key={toast.id}
+            className="pointer-events-auto bg-gray-900 border border-green-700/60 rounded-lg p-4 w-72 shadow-xl shadow-black/50 animate-slide-in"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shrink-0" />
+                <span className="text-green-400 font-bold text-xs uppercase tracking-widest">Trade Executed</span>
+              </div>
+              <button
+                onClick={() => onDismiss(toast.id)}
+                className="text-gray-600 hover:text-gray-400 text-xs leading-none"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="text-gray-100 font-semibold text-sm mt-2 leading-snug truncate" title={toast.trade.target_team}>
+              {toast.trade.target_team}
+            </p>
+            <div className="flex items-center gap-4 mt-2 text-xs">
+              <span className={`font-bold ${isBuy ? "text-green-400" : "text-red-400"}`}>{toast.trade.action}</span>
+              <span className={`font-bold ${edge >= 0 ? "text-green-400" : "text-red-400"}`}>
+                {edge >= 0 ? "+" : ""}{edge.toFixed(1)}% edge
+              </span>
+              <span className="text-gray-500">${toast.trade.stake_amount}</span>
+            </div>
+            {toast.trade.order_hash && (
+              <p className="text-cyan-700 text-xs mt-2 font-mono truncate" title={toast.trade.order_hash}>
+                {toast.trade.order_hash.slice(0, 22)}…
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
