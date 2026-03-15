@@ -256,7 +256,7 @@ export default function Dashboard() {
   const totalPnl    = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
   const totalStaked = trades.reduce((s, t) => s + t.stake_amount, 0);
   const avgEdge     = trades.length > 0
-    ? trades.reduce((s, t) => s + Math.abs(alignedProbs(t).edge), 0) / trades.length * 100
+    ? trades.reduce((s, t) => s + Math.abs(betEdge(t)), 0) / trades.length * 100
     : null;
   const signedCount = trades.filter(t => t.order_hash).length;
 
@@ -699,12 +699,12 @@ export default function Dashboard() {
                       <th className="px-4 py-3">Action</th>
                       <th className="px-4 py-3">Stake</th>
                       <th className="px-4 py-3">
-                        <div>Mkt Win %</div>
-                        <div className="text-gray-600 normal-case font-normal text-xs tracking-normal">P(bet team wins)</div>
+                        <div>Market %</div>
+                        <div className="text-gray-600 normal-case font-normal text-xs tracking-normal">home / away</div>
                       </th>
                       <th className="px-4 py-3">
-                        <div>Mdl Win %</div>
-                        <div className="text-gray-600 normal-case font-normal text-xs tracking-normal">P(bet team wins)</div>
+                        <div>Model %</div>
+                        <div className="text-gray-600 normal-case font-normal text-xs tracking-normal">home / away</div>
                       </th>
                       <th className="px-4 py-3">Edge</th>
                       <th className="px-4 py-3">Order Hash</th>
@@ -714,8 +714,10 @@ export default function Dashboard() {
                   </thead>
                   <tbody>
                     {trades.map(t => {
-                      const { mkt, mdl, edge } = alignedProbs(t);
-                      const edgePct = edge * 100;
+                      const teams = teamNames(t, trades);
+                      const mkt = t.market_implied_prob;
+                      const mdl = t.model_implied_prob;
+                      const edgePct = betEdge(t) * 100;
                       return (
                         <tr
                           key={t.id}
@@ -740,12 +742,12 @@ export default function Dashboard() {
                           </td>
                           <td className="px-4 py-3 text-gray-400">${t.stake_amount.toFixed(0)}</td>
                           <td className="px-4 py-3">
-                            <div className="text-gray-300">{(mkt * 100).toFixed(1)}%</div>
-                            <div className="text-xs text-gray-600 mt-0.5">{betTeam(t)}</div>
+                            <div className="text-gray-300">{(mkt * 100).toFixed(1)}% <span className="text-blue-400 text-xs">{teams.home}</span></div>
+                            <div className="text-gray-500 text-xs mt-0.5">{((1 - mkt) * 100).toFixed(1)}% <span className="text-violet-400">{teams.away}</span></div>
                           </td>
                           <td className="px-4 py-3">
-                            <div className="text-gray-300">{(mdl * 100).toFixed(1)}%</div>
-                            <div className="text-xs text-gray-600 mt-0.5">{betTeam(t)}</div>
+                            <div className="text-gray-300">{(mdl * 100).toFixed(1)}% <span className="text-blue-400 text-xs">{teams.home}</span></div>
+                            <div className="text-gray-500 text-xs mt-0.5">{((1 - mdl) * 100).toFixed(1)}% <span className="text-violet-400">{teams.away}</span></div>
                           </td>
                           <td className={`px-4 py-3 font-bold ${edgePct >= 0 ? "text-green-400" : "text-red-400"}`}>
                             {edgePct >= 0 ? "+" : ""}{edgePct.toFixed(1)}%
@@ -842,17 +844,41 @@ function SectionHeader({
   );
 }
 
-/** Return market/model probs aligned to the traded team's perspective.
- *  Raw DB values are always P(home wins). When bought_home=false we flip both. */
-function alignedProbs(t: Trade): { mkt: number; mdl: number; edge: number } {
-  const flip = t.bought_home === false;
-  const mkt = flip ? 1 - t.market_implied_prob : t.market_implied_prob;
-  const mdl = flip ? 1 - t.model_implied_prob  : t.model_implied_prob;
-  return { mkt, mdl, edge: mdl - mkt };
+/** Raw P(home wins) values — no flipping. Consistent regardless of action. */
+function rawProbs(t: Trade): { mkt: number; mdl: number } {
+  return { mkt: t.market_implied_prob, mdl: t.model_implied_prob };
 }
 
-/** The team whose win-probability the market%/model% columns are showing.
- *  For BUY rows the action encodes the team directly. For SELL rows use target_team. */
+/** Edge from the bet-team's perspective (positive = good trade). */
+function betEdge(t: Trade): number {
+  const raw = t.model_implied_prob - t.market_implied_prob;
+  return t.bought_home === false ? -raw : raw;
+}
+
+/** Extract home & away team names from trade data. */
+function teamNames(t: Trade, allTrades?: Trade[]): { home: string; away: string } {
+  // BUY rows: target_team = "Away vs. Home" (Polymarket convention)
+  const parts = t.target_team.split(/\s+vs\.?\s+/);
+  if (parts.length === 2) {
+    return { away: parts[0].trim(), home: parts[1].trim() };
+  }
+  // SELL rows: look up a BUY row for the same game
+  if (allTrades) {
+    const buyRow = allTrades.find(
+      o => o.game_id === t.game_id && o.target_team.includes(" vs")
+    );
+    if (buyRow) {
+      const bp = buyRow.target_team.split(/\s+vs\.?\s+/);
+      if (bp.length === 2) return { away: bp[0].trim(), home: bp[1].trim() };
+    }
+  }
+  // Fallback: only know one team
+  if (t.bought_home === true) return { home: t.target_team, away: "" };
+  if (t.bought_home === false) return { home: "", away: t.target_team };
+  return { home: t.target_team, away: "" };
+}
+
+/** The team whose token was purchased. */
 function betTeam(t: Trade): string {
   if (t.action.startsWith("BUY_")) {
     return t.action.slice(4).replace(/_/g, " ")
@@ -862,8 +888,9 @@ function betTeam(t: Trade): string {
 }
 
 function ActivePositionCard({ trade }: { trade: Trade }) {
-  const { edge } = alignedProbs(trade);
-  const edgePct  = edge * 100;
+  const edge    = betEdge(trade);
+  const edgePct = edge * 100;
+  const teams   = teamNames(trade);
   const isBuyHome = trade.bought_home !== false;
   return (
     <div className="bg-gray-900 border border-yellow-900/30 rounded-lg p-4 space-y-3 hover:border-yellow-700/40 transition-colors">
@@ -883,11 +910,11 @@ function ActivePositionCard({ trade }: { trade: Trade }) {
         <DataPoint label="Stake">
           <span className="text-gray-200 font-semibold">${trade.stake_amount.toFixed(0)} USDC</span>
         </DataPoint>
-        <DataPoint label="Market odds">
-          <span className="text-gray-300">{(alignedProbs(trade).mkt * 100).toFixed(1)}%</span>
+        <DataPoint label={`Market · ${teams.home || "home"}`}>
+          <span className="text-gray-300">{(trade.market_implied_prob * 100).toFixed(1)}%</span>
         </DataPoint>
-        <DataPoint label="Model confidence">
-          <span className="text-gray-300">{(alignedProbs(trade).mdl * 100).toFixed(1)}%</span>
+        <DataPoint label={`Model · ${teams.home || "home"}`}>
+          <span className="text-gray-300">{(trade.model_implied_prob * 100).toFixed(1)}%</span>
         </DataPoint>
       </div>
 
@@ -902,8 +929,8 @@ function ActivePositionCard({ trade }: { trade: Trade }) {
 
       <div className="flex items-center justify-between pt-2 border-t border-gray-800">
         <span className="text-gray-600 text-xs">{fmt(trade.timestamp)}</span>
-        <span className={`text-sm font-bold ${edge >= 0 ? "text-green-400" : "text-red-400"}`}>
-          EDGE {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
+        <span className={`text-sm font-bold ${edgePct >= 0 ? "text-green-400" : "text-red-400"}`}>
+          EDGE {edgePct >= 0 ? "+" : ""}{edgePct.toFixed(1)}%
         </span>
       </div>
     </div>

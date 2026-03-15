@@ -327,7 +327,6 @@ def fetch_polymarket_game_odds():
 
                         if "spread" in sq.lower() and sp:
                             # Extract spread number
-                            import re
                             spread_match = re.search(r'[-+]?\d+\.?\d*', sq.split("Spread:")[-1] if "Spread:" in sq else sq)
                             if spread_match:
                                 game_odds[game_key]["spread"] = float(spread_match.group())
