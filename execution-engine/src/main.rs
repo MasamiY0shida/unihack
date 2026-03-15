@@ -1186,8 +1186,10 @@ async fn run_ws_ingestion(
                     entry.question, reason, positions.len()
                 );
 
-                let exit_price = if pos.bought_home { market_prob } else { 1.0 - market_prob };
-                let sell_entry = if pos.bought_home { pos.entry_price } else { 1.0 - pos.entry_price };
+                let exit_price  = if pos.bought_home { market_prob } else { 1.0 - market_prob };
+                let sell_entry  = if pos.bought_home { pos.entry_price } else { 1.0 - pos.entry_price };
+                // Align model_prob to same team perspective as exit_price so display is consistent
+                let model_display = if pos.bought_home { model_prob } else { 1.0 - model_prob };
 
                 let signed = wallet.sign_order(
                     &pos.token_id, market_prob, STAKE_USDC, wallet::Side::Sell,
@@ -1201,7 +1203,7 @@ async fn run_ws_ingestion(
                     &reason,
                     sell_entry,
                     exit_price,
-                    model_prob,
+                    model_display,
                     signed.as_ref(),
                 ) {
                     error!("DB sell write failed: {e}");
