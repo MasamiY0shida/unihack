@@ -36,16 +36,16 @@ class ModelSuite:
     def __init__(self):
         print("Loading models...")
         self.win_model = xgb.XGBClassifier()
-        self.win_model.load_model(f"{DATA_DIR}/v3_win_probability.json")
+        self.win_model.load_model(f"{DATA_DIR}/v4_win_probability.json")
 
         self.margin_model = xgb.XGBRegressor()
-        self.margin_model.load_model(f"{DATA_DIR}/v3_margin.json")
+        self.margin_model.load_model(f"{DATA_DIR}/v4_margin.json")
 
         self.proxy_model = xgb.XGBClassifier()
-        self.proxy_model.load_model(f"{DATA_DIR}/v3_market_proxy.json")
+        self.proxy_model.load_model(f"{DATA_DIR}/v4_market_proxy.json")
 
         self.edge_model = xgb.XGBClassifier()
-        self.edge_model.load_model(f"{DATA_DIR}/v3_edge_model.json")
+        self.edge_model.load_model(f"{DATA_DIR}/v4_edge_model.json")
 
         print("All models loaded.")
 
@@ -59,12 +59,29 @@ class ModelSuite:
         margin_pred = float(self.margin_model.predict(live_arr)[0])
 
         # Clamp extreme predictions based on game progress.
-        # Early in a game, small sample live stats (e.g. 2/2 FG = 100%) push
-        # the model to unrealistic extremes. Cap max confidence by progress:
-        # Q1 start ~65%, Q2 end ~82%, Q3 end ~93%, Q4 ~99%.
         gp = features.get("GAME_PROGRESS", 0.5)
         max_prob = min(0.99, 0.65 + gp * 0.34)
         win_prob = max(1.0 - max_prob, min(max_prob, win_prob))
+
+        # v4: Game-state probability floor based on possession math.
+        # If a team leads and there aren't enough possessions to close
+        # the gap, enforce a minimum probability regardless of team identity.
+        margin = features.get("MARGIN", 0)
+        secs_left = features.get("GAME_SECONDS_LEFT", 2880)
+        if abs(margin) > 0 and secs_left < 300:  # only in final 5 min
+            poss_left = max(secs_left / 14.0, 0.1)
+            pts_needed = abs(margin)
+            # Each possession can yield ~1.1 pts on avg
+            poss_needed = pts_needed / 1.1
+            if poss_needed > poss_left:
+                # Mathematically very difficult to come back
+                # Floor = 1 - (remaining_chance)^deficit_ratio
+                deficit_ratio = min(poss_needed / poss_left, 5.0)
+                floor = 1.0 - (0.5 ** deficit_ratio)
+                if margin > 0:
+                    win_prob = max(win_prob, floor)
+                else:
+                    win_prob = min(win_prob, 1.0 - floor)
 
         edge = win_prob - proxy_prob
         abs_edge = abs(edge)

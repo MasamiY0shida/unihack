@@ -118,11 +118,18 @@ def get_play_by_play(game_id):
         return None
 
 def parse_clock(clock_str):
-    """Convert 'MM:SS' to seconds."""
+    """Convert 'MM:SS' or 'MM:SS.ff' to integer seconds."""
+    if not clock_str:
+        return 0
     try:
-        parts = str(clock_str).split(":")
-        return int(parts[0]) * 60 + int(parts[1])
-    except:
+        text = str(clock_str).strip()
+        if not text:
+            return 0
+        parts = text.split(":")
+        minutes = int(parts[0])
+        seconds = int(float(parts[1])) if len(parts) > 1 else 0
+        return minutes * 60 + seconds
+    except (ValueError, IndexError):
         return 0
 
 # Usage:

@@ -34,11 +34,11 @@ class FeatureEngine:
             self.off_court = pd.DataFrame()
 
         # Load feature column lists
-        with open(f"{DATA_DIR}/v3_live_features.json") as f:
+        with open(f"{DATA_DIR}/v4_live_features.json") as f:
             self.live_features = json.load(f)
-        with open(f"{DATA_DIR}/v3_pregame_features.json") as f:
+        with open(f"{DATA_DIR}/v4_pregame_features.json") as f:
             self.pregame_features = json.load(f)
-        with open(f"{DATA_DIR}/v3_edge_features.json") as f:
+        with open(f"{DATA_DIR}/v4_edge_features.json") as f:
             self.edge_features = json.load(f)
 
         # Build lookups
@@ -231,8 +231,8 @@ class FeatureEngine:
             # Time interactions (v3: force temporal awareness)
             "MARGIN_X_PROGRESS": margin * game_progress,
             "ABS_MARGIN_X_PROGRESS": abs(margin) * game_progress,
-            "MARGIN_OVER_SQRT_TIME": margin / max(np.sqrt(secs_left / 60), 1.0),
-            "ABS_MARGIN_OVER_SQRT_TIME": abs(margin) / max(np.sqrt(secs_left / 60), 1.0),
+            "MARGIN_OVER_SQRT_TIME": margin / max(np.sqrt(secs_left / 60), 0.05),
+            "ABS_MARGIN_OVER_SQRT_TIME": abs(margin) / max(np.sqrt(secs_left / 60), 0.05),
             "TIME_REMAINING_FRAC": secs_left / 2880,
             "STAT_RELIABILITY": min(total_points / 30.0, 1.0),
             "PERIOD_ORDINAL": min(period, 5),
@@ -241,6 +241,15 @@ class FeatureEngine:
             "IS_BLOWOUT": int(abs(margin) >= 20),
             "IS_CLUTCH": int((abs(margin) <= 5) and (secs_left <= 300) and (period == 4)),
             "IS_FIRST_HALF": int(period <= 2),
+            # v4: Possession-based features
+            "POSSESSIONS_LEFT": max(secs_left / 14.0, 0),
+            "POSSESSIONS_TO_CLOSE": abs(margin) / 1.1 if margin != 0 else 0,
+            "CLOSE_RATIO": (abs(margin) / 1.1) / max(secs_left / 14.0, 0.1),
+            "GAME_DECIDED": int(
+                abs(margin) > 0 and
+                (abs(margin) / 1.1) > max(secs_left / 14.0, 0) * 1.5
+            ),
+            "MARGIN_X_TIME_DECAY": margin * np.exp(-secs_left / 300),
             # Lead history
             "MAX_HOME_LEAD": max_home_lead,
             "MAX_AWAY_LEAD": max_away_lead,
@@ -424,6 +433,15 @@ class FeatureEngine:
         features["LIVE_FOUL_TROUBLE_DIFF"] = (
             features["LIVE_AWAY_FOUL_TROUBLE"] - features["LIVE_HOME_FOUL_TROUBLE"]
         )  # positive = away team in more trouble = good for home
+
+        # v4: Time-faded pregame interaction features
+        time_frac = secs_left / 2880
+        for col in ["DIFF_STATIC_NET_RATING", "DIFF_STATIC_OFF_RATING",
+                     "DIFF_STATIC_DEF_RATING",
+                     "DIFF_STATIC_CLUTCH_NET_RATING",
+                     "DIFF_STATIC_CLUTCH_W_PCT"]:
+            if col in features:
+                features[f"{col}_FADED"] = features[col] * time_frac
 
         # v3: Time-damp all LIVE_ features so model trusts them less in Q1
         damp = max(game_progress, 0.05)
