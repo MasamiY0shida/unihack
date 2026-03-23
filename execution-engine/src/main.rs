@@ -177,7 +177,7 @@ const TIME_DECAY_SECS: f64 = 120.0;
 const SCALE_IN_EDGE_INCREASE: f64 = 0.10;
 
 /// Maximum number of BUY trades allowed per game (condition_id).
-const MAX_BUYS_PER_GAME: u32 = 3;
+const MAX_BUYS_PER_GAME: u32 = 1;
 
 // ── Position tracking ─────────────────────────────────────────────────────────
 

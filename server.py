@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import xgboost as xgb
+import joblib
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -47,6 +48,15 @@ class ModelSuite:
         self.edge_model = xgb.XGBClassifier()
         self.edge_model.load_model(f"{DATA_DIR}/v4_edge_model.json")
 
+        # Isotonic calibrator: maps raw win_prob → calibrated probability
+        cal_path = f"{DATA_DIR}/v4_calibrator.pkl"
+        try:
+            self.calibrator = joblib.load(cal_path)
+            print(f"Loaded isotonic calibrator: {cal_path}")
+        except FileNotFoundError:
+            self.calibrator = None
+            print("WARNING: No calibrator found, using raw probabilities")
+
         print("All models loaded.")
 
     def predict(self, features, feature_engine):
@@ -54,14 +64,15 @@ class ModelSuite:
         live_arr = feature_engine.to_live_array(features)
         pregame_arr = feature_engine.to_pregame_array(features)
 
-        win_prob = float(self.win_model.predict_proba(live_arr)[0][1])
+        win_prob_raw = float(self.win_model.predict_proba(live_arr)[0][1])
         proxy_prob = float(self.proxy_model.predict_proba(pregame_arr)[0][1])
         margin_pred = float(self.margin_model.predict(live_arr)[0])
 
-        # Clamp extreme predictions based on game progress.
-        gp = features.get("GAME_PROGRESS", 0.5)
-        max_prob = min(0.99, 0.65 + gp * 0.34)
-        win_prob = max(1.0 - max_prob, min(max_prob, win_prob))
+        # Isotonic calibration: correct systematic over/under-confidence
+        if self.calibrator is not None:
+            win_prob = float(self.calibrator.predict([win_prob_raw])[0])
+        else:
+            win_prob = win_prob_raw
 
         # v4: Game-state probability floor based on possession math.
         # If a team leads and there aren't enough possessions to close

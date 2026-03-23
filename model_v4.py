@@ -18,6 +18,8 @@ import json
 from datetime import timedelta
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
+from sklearn.isotonic import IsotonicRegression
+import joblib
 import xgboost as xgb
 import warnings
 warnings.filterwarnings("ignore")
@@ -1132,12 +1134,51 @@ def generate_oof_predictions(df, pregame_features, live_features):
     df = df.dropna(subset=["OOF_PROXY_PROB", "OOF_LIVE_PROB"])
 
     # Overall OOF metrics
+    raw_brier = brier_score_loss(df['HOME_WON'], df['OOF_LIVE_PROB'])
     print(f"\n  Overall OOF Market Proxy Brier: "
           f"{brier_score_loss(df['HOME_WON'], df['OOF_PROXY_PROB']):.4f}")
-    print(f"  Overall OOF Live Model Brier: "
-          f"{brier_score_loss(df['HOME_WON'], df['OOF_LIVE_PROB']):.4f}")
+    print(f"  Overall OOF Live Model Brier (raw): {raw_brier:.4f}")
     print(f"  Overall OOF Margin MAE: "
           f"{mean_absolute_error(df['FINAL_MARGIN'], df['OOF_MARGIN_PRED']):.2f}")
+
+    # ── Fit isotonic calibrator on OOF predictions ──
+    # This learns the mapping: raw_model_prob → calibrated_prob
+    # using out-of-fold predictions (no data leakage).
+    print("\n  Fitting isotonic calibrator on OOF predictions...")
+    iso = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
+    iso.fit(df["OOF_LIVE_PROB"].values, df["HOME_WON"].values)
+
+    # Verify calibration improvement
+    calibrated = iso.predict(df["OOF_LIVE_PROB"].values)
+    cal_brier = brier_score_loss(df["HOME_WON"], calibrated)
+    print(f"  OOF Brier (raw):        {raw_brier:.4f}")
+    print(f"  OOF Brier (calibrated): {cal_brier:.4f}")
+    print(f"  Improvement:            {(raw_brier - cal_brier) / raw_brier * 100:.1f}%")
+
+    # Show calibration table before/after
+    print(f"\n  Calibration check (10 bins):")
+    print(f"  {'Bin':<12} {'Raw Pred':>10} {'Cal Pred':>10} {'Actual':>10} {'N':>6}")
+    print(f"  {'─' * 52}")
+    bin_edges = np.linspace(0, 1, 11)
+    for i in range(10):
+        mask = (df["OOF_LIVE_PROB"] >= bin_edges[i]) & (df["OOF_LIVE_PROB"] < bin_edges[i+1])
+        if i == 9:
+            mask = (df["OOF_LIVE_PROB"] >= bin_edges[i]) & (df["OOF_LIVE_PROB"] <= bin_edges[i+1])
+        n = mask.sum()
+        if n == 0:
+            continue
+        raw_mean = df.loc[mask, "OOF_LIVE_PROB"].mean()
+        cal_mean = calibrated[mask.values].mean()
+        actual = df.loc[mask, "HOME_WON"].mean()
+        print(f"  [{bin_edges[i]:.1f},{bin_edges[i+1]:.1f})  {raw_mean:>10.3f} {cal_mean:>10.3f} {actual:>10.3f} {n:>6}")
+
+    # Save calibrator
+    cal_path = os.path.join(DATA_DIR, "v4_calibrator.pkl")
+    joblib.dump(iso, cal_path)
+    print(f"\n  Saved calibrator: {cal_path}")
+
+    # Store calibrated OOF for downstream use
+    df["OOF_LIVE_PROB_CAL"] = calibrated
 
     return df
 
